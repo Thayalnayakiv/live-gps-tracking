@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Live Tracker + TN Districts + Directions</title>
+
+<!-- Leaflet CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+
+<!-- Leaflet Routing Machine CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css"/>
+
+<style>
+  :root{--panel-w:360px}
+  html,body { height:100%; margin:0; font-family: Arial, Helvetica, sans-serif; }
+  #map { position: absolute; left:0; top:0; right: var(--panel-w); bottom:0; }
+  #panel {
+    position: absolute; right:0; top:0; width:var(--panel-w); bottom:0;
+    background:#fff; box-shadow: -4px 0 18px rgba(0,0,0,0.08); padding:12px; overflow:auto;
+  }
+  h2{margin:6px 0 12px}
+  .section{margin-bottom:14px}
+  label{display:block;font-size:13px;margin-bottom:6px;color:#333}
+  input[type="text"], button, select {
+    width:100%; padding:8px 10px; margin-bottom:8px; box-sizing:border-box;
+    border:1px solid #ddd; border-radius:6px; font-size:14px;
+  }
+  .row{display:flex; gap:8px}
+  .row > *{flex:1}
+  button.primary { background:#1976d2; color:#fff; border:none; cursor:pointer; }
+  button.ghost { background:#f2f2f2; border:none; cursor:pointer; }
+  #countryList { font-size:13px; line-height:1.5; border-top:1px solid #eee; padding-top:8px; }
+  .small { font-size:12px; color:#555 }
+  #routeInfo { padding:8px; background:#f9f9f9; border-radius:6px; font-weight:600; }
+  .hint { font-size:12px; color:#666; margin-top:6px }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="panel">
+  <h2>Live Tracker + Search & Directions</h2>
+
+  <div class="section">
+    <label>Session ID (optional — share to track others)</label>
+    <div class="row">
+      <input id="sessionInput" placeholder="enter session id or click Create" />
+      <button id="createBtn" class="ghost">Create</button>
+    </div>
+    <div class="row">
+      <button id="joinBtn" class="primary">Join Session</button>
+      <button id="leaveBtn" class="ghost">Leave</button>
+    </div>
+    <div class="small">Your client id: <span id="clientId">—</span></div>
+  </div>
+
+  <div class="section">
+    <label>Quick search any place (global)</label>
+    <div class="row">
+      <input id="globalSearch" placeholder="E.g. Taj Mahal, Chennai, Eiffel Tower..." />
+      <button id="goSearch" class="primary">Go</button>
+    </div>
+    <div class="hint">If you type an Indian district (e.g. "Chennai", "Coimbatore", "Madurai"), it will prefer searching as "<em>District, Tamil Nadu, India</em>".</div>
+  </div>
+
+  <div class="section">
+    <label>Directions — From & To</label>
+    <input id="fromInput" placeholder="From (leave blank to use my location)" />
+    <input id="toInput" placeholder="To (type a place or TN district)" />
+    <div class="row">
+      <button id="routeBtn" class="primary">Get Route</button>
+      <button id="clearRoute" class="ghost">Clear</button>
+    </div>
+    <div id="routeInfo" style="display:none;margin-top:8px"></div>
+    <div class="hint">Route uses open routing (OSRM via Leaflet Routing Machine). Distances shown in kilometers.</div>
+  </div>
+
+  <div class="section">
+    <h3>Nearest places (sample)</h3>
+    <div id="countryList" class="small">Move around to populate nearest list.</div>
+  </div>
+
+  <hr/>
+
+  <div class="small">
+    <strong>Notes:</strong>
+    <ul>
+      <li>Geolocation works only on HTTPS or localhost.</li>
+      <li>Replace Firebase config in script before use.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- Leaflet JS -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Routing -->
+<script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.min.js"></script>
+<!-- Firebase compat (client-only) -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+
+<script>
+/* =================== CONFIG — REPLACE with your Firebase project =================== */
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  databaseURL: "https://YOUR_PROJECT.firebaseio.com",
+  projectId: "YOUR_PROJECT",
+  storageBucket: "YOUR_PROJECT.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+/* ================================================================================== */
+
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
+/* -------------------- Map setup -------------------- */
+const map = L.map('map', {zoomControl:true}).setView([11.0, 78.0], 6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+/* State */
+let myLat=null, myLon=null;
+let myMarker=null;
+let myPath=null;
+const clientId = 'c_' + Math.random().toString(36).slice(2,9);
+document.getElementById('clientId').textContent = clientId;
+
+let sessionId = null; // optional session grouping in DB
+let watchId = null;
+
+/* For remote clients */
+const remoteMarkers = {};    // clientId -> marker
+const remotePaths = {};      // clientId -> polyline
+let clientsRefGlobal = db.ref('clients'); // fallback global
+
+/* ---- Tamil Nadu districts names (used to force Nominatim query to TN) ---- */
+const tamilNaduDistricts = [
+  "Ariyalur","Chengalpattu","Chennai","Coimbatore","Cuddalore","Dharmapuri","Dindigul",
+  "Erode","Kallakurichi","Kancheepuram","Karur","Krishnagiri","Madurai","Mayiladuthurai",
+  "Nagapattinam","Namakkal","Nilgiris","Perambalur","Pudukkottai","Ramanathapuram",
+  "Ranipet","Salem","Sivaganga","Tenkasi","Thanjavur","Theni","Thiruvallur","Thiruvarur",
+  "Thoothukudi","Tiruchirappalli","Tirunelveli","Tirupattur","Tiruppur","Tiruvannamalai",
+  "Vellore","Villupuram","Virudhunagar"
+];
+
+/* small helper: detect TN district match (fuzzy) */
+function findTamilNaduDistrict(query) {
+  if (!query) return null;
+  const q = query.trim().toLowerCase();
+  // exact first
+  for (const d of tamilNaduDistricts) if (d.toLowerCase() === q) return d;
+  // startsWith
+  for (const d of tamilNaduDistricts) if (d.toLowerCase().startsWith(q)) return d;
+  // includes
+  for (const d of tamilNaduDistricts) if (d.toLowerCase().includes(q)) return d;
+  return null;
+}
+
+/* ------------------ Geocoding (Nominatim) ------------------ */
+async function geocode(query, preferTN=false) {
+  if (!query) return null;
+  // if preferTN and query simple district name, append "Tamil Nadu, India"
+  let q = query;
+  if (preferTN) {
+    const tn = findTamilNaduDistrict(query);
+    if (tn) q = tn + ', Tamil Nadu, India';
+  }
+  const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&q=' + encodeURIComponent(q) + '&limit=5&addressdetails=1';
+  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  const data = await res.json();
+  if (!Array.isArray(data) || data.length===0) return null;
+  // return first result
+  return {
+    lat: parseFloat(data[0].lat),
+    lon: parseFloat(data[0].lon),
+    display_name: data[0].display_name,
+    raw: data[0]
+  };
+}
+
+/* ------------------ Routing (directions) ------------------ */
+let routingControl = null;
+function clearRouting() {
+  if (routingControl) { map.removeControl(routingControl); routingControl = null; }
+  document.getElementById('routeInfo').style.display = 'none';
+  document.getElementById('routeInfo').textContent = '';
+}
+
+function showRoute(fromLatLng, toLatLng) {
+  clearRouting();
+  routingControl = L.Routing.control({
+    waypoints: [ L.latLng(fromLatLng.lat, fromLatLng.lon), L.latLng(toLatLng.lat, toLatLng.lon) ],
+    lineOptions: { styles: [{color: '#1976d2', weight: 5}] },
+    show: false,
+    addWaypoints: false,
+    draggableWaypoints: false,
+    fitSelectedRoute: true,
+    createMarker: function(i, wp, n) {
+      // custom markers: origin blue, dest green
+      if (i === 0) return L.marker(wp.latLng, {icon: L.icon({iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png'})}).bindPopup('Origin');
+      if (i === n-1) return L.marker(wp.latLng, {icon: L.icon({iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png'})}).bindPopup('Destination');
+      return null;
+    }
+  }).addTo(map);
+
+  routingControl.on('routesfound', function(e) {
+    const routes = e.routes;
+    if (!routes || routes.length===0) return;
+    const summary = routes[0].summary;
+    const distKm = (summary.totalDistance/1000).toFixed(2);
+    const timeMin = Math.round(summary.totalTime/60);
+    const ri = document.getElementById('routeInfo');
+    ri.style.display = 'block';
+    ri.textContent = `Distance: ${distKm} km · ETA: ${timeMin} min`;
+  });
+
+  routingControl.on('routingerror', function(err) {
+    console.error('Routing error', err);
+    alert('Routing error. Try again.');
+  });
+}
+
+/* ------------------ Utility: Haversine ------------------ */
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2-lat1) * Math.PI/180;
+  const dLon = (lon2-lon1) * Math.PI/180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+/* ------------------ UI elements ------------------ */
+const globalSearchEl = document.getElementById('globalSearch');
+const goSearchBtn = document.getElementById('goSearch');
+const searchFromEl = document.getElementById('fromInput');
+const searchToEl = document.getElementById('toInput');
+const routeBtn = document.getElementById('routeBtn');
+const clearRouteBtn = document.getElementById('clearRoute');
+const createBtn = document.getElementById('createBtn');
+const joinBtn = document.getElementById('joinBtn');
+const leaveBtn = document.getElementById('leaveBtn');
+const sessionInput = document.getElementById('sessionInput');
+
+/* ------------------ Session helpers ------------------ */
+function setSession(sid) {
+  sessionId = sid;
+  if (sessionId) {
+    clientsRefGlobal = db.ref('sessions/' + sessionId + '/clients');
+    alert('Session set: ' + sessionId);
+  } else {
+    clientsRefGlobal = db.ref('clients');
+  }
+}
+createBtn.addEventListener('click', ()=> {
+  const sid = Math.random().toString(36).slice(2,9);
+  sessionInput.value = sid;
+  setSession(sid);
+});
+joinBtn.addEventListener('click', ()=> {
+  const sid = sessionInput.value.trim();
+  if (!sid) return alert('Enter session id or create one.');
+  setSession(sid);
+  startSharing(); // join and share location
+});
+leaveBtn.addEventListener('click', ()=> {
+  setSession(null);
+  stopSharing();
+  sessionInput.value = '';
+  alert('Left session. Using global channel.');
+});
+
+/* ------------------ Live tracking & Firebase integration ------------------ */
+function startSharing() {
+  // set onDisconnect cleanup for this client
+  const myRef = clientsRefGlobal.child(clientId);
+  myRef.onDisconnect().remove();
+
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  if (!navigator.geolocation) return alert('Geolocation not supported.');
+
+  watchId = navigator.geolocation.watchPosition(pos => {
+    myLat = pos.coords.latitude;
+    myLon = pos.coords.longitude;
+
+    // update marker & path
+    if (!myMarker) {
+      myMarker = L.circleMarker([myLat, myLon], {radius:8, color:'#1976d2'}).addTo(map).bindPopup('You');
+      myPath = L.polyline([[myLat, myLon]], {color:'#1976d2'}).addTo(map);
+      map.setView([myLat, myLon], 12);
+    } else {
+      // animate (simple set)
+      myMarker.setLatLng([myLat, myLon]);
+      myPath.addLatLng([myLat, myLon]);
+    }
+
+    // send to Firebase
+    myRef.set({ lat: myLat, lon: myLon, ts: Date.now() });
+
+  }, err => {
+    console.error(err);
+    alert('Geolocation error: ' + (err.message || err));
+  }, { enableHighAccuracy: true, maximumAge: 1500, timeout: 10000 });
+
+  // listen for remote clients in this session ref
+  clientsRefGlobal.on('child_added', snap => {
+    const id = snap.key;
+    const v = snap.val();
+    if (id === clientId) return;
+    addOrUpdateRemote(id, v);
+  });
+  clientsRefGlobal.on('child_changed', snap => {
+    const id = snap.key;
+    const v = snap.val();
+    if (id === clientId) return;
+    addOrUpdateRemote(id, v);
+  });
+  clientsRefGlobal.on('child_removed', snap => {
+    const id = snap.key;
+    removeRemote(id);
+  });
+}
+function stopSharing() {
+  if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  // remove own node
+  clientsRefGlobal.child(clientId).remove().catch(()=>{});
+  // detach listeners
+  clientsRefGlobal.off();
+  // clear remote markers
+  for (const k of Object.keys(remoteMarkers)) removeRemote(k);
+  if (myMarker) { map.removeLayer(myMarker); myMarker = null; }
+  if (myPath) { map.removeLayer(myPath); myPath = null; }
+}
+
+/* remote helper */
+function addOrUpdateRemote(id, v) {
+  if (!v) return;
+  const lat = v.lat, lon = v.lon;
+  if (!remoteMarkers[id]) {
+    remoteMarkers[id] = L.marker([lat, lon]).addTo(map).bindPopup('Client: ' + id);
+    remotePaths[id] = L.polyline([[lat, lon]], { color: '#ff6f00' }).addTo(map);
+  } else {
+    // animate by simple interpolation (if desired, could be smoother)
+    remoteMarkers[id].setLatLng([lat, lon]);
+    remotePaths[id].addLatLng([lat, lon]);
+  }
+}
+function removeRemote(id) {
+  if (remoteMarkers[id]) { map.removeLayer(remoteMarkers[id]); delete remoteMarkers[id]; }
+  if (remotePaths[id]) { map.removeLayer(remotePaths[id]); delete remotePaths[id]; }
+}
+
+/* auto-start sharing to global channel (you can change by joining session) */
+setSession(null);
+startSharing();
+
+/* ------------------ Search handlers ------------------ */
+goSearchBtn.addEventListener('click', async () => {
+  const q = globalSearchEl.value.trim();
+  if (!q) return;
+  // prefer TN district if matches
+  const preferTN = !!findTamilNaduDistrict(q);
+  const g = await geocode(q, preferTN);
+  if (!g) return alert('Place not found');
+  map.setView([g.lat, g.lon], 12);
+  L.popup().setLatLng([g.lat, g.lon]).setContent(`<b>${g.display_name}</b>`).openOn(map);
+});
+
+/* allow Enter */
+globalSearchEl.addEventListener('keypress', (e)=> { if (e.key==='Enter') goSearchBtn.click(); });
+
+/* ------------------ Directions handlers ------------------ */
+routeBtn.addEventListener('click', async () => {
+  clearRouting();
+  const fromText = searchFromEl.value.trim();
+  const toText = searchToEl.value.trim();
+  if (!toText) return alert('Enter destination (To).');
+
+  let fromCoord = null;
+  if (!fromText) {
+    // use my location
+    if (myLat === null || myLon === null) return alert('My location not available yet — allow location and wait a moment.');
+    fromCoord = {lat: myLat, lon: myLon};
+  } else {
+    const preferTNFrom = !!findTamilNaduDistrict(fromText);
+    const g1 = await geocode(fromText, preferTNFrom);
+    if (!g1) return alert('Origin not found');
+    fromCoord = {lat: g1.lat, lon: g1.lon};
+  }
+
+  // destination (prefer Tamil Nadu if district name)
+  const preferTNTo = !!findTamilNaduDistrict(toText);
+  const g2 = await geocode(toText, preferTNTo);
+  if (!g2) return alert('Destination not found');
+  const toCoord = {lat: g2.lat, lon: g2.lon};
+
+  // show markers/popup for both
+  L.marker([fromCoord.lat, fromCoord.lon]).addTo(map).bindPopup('From').openPopup();
+  L.marker([toCoord.lat, toCoord.lon]).addTo(map).bindPopup('To');
+
+  // show route & summary
+  showRoute(fromCoord, toCoord);
+});
+clearRouteBtn.addEventListener('click', ()=> {
+  clearRouting();
+});
+
+/* ------------------ Nearest list (sample using small set) ------------------ */
+const samplePlaces = [
+  {name:'Chennai (capital TN)', lat:13.0827, lon:80.2707},
+  {name:'Coimbatore', lat:11.0168, lon:76.9558},
+  {name:'Madurai', lat:9.9252, lon:78.1198},
+  {name:'Tiruchirappalli', lat:10.7905, lon:78.7047},
+  {name:'Salem', lat:11.6643, lon:78.1460},
+  {name:'Erode', lat:11.3410, lon:77.7172},
+  {name:'Vellore', lat:12.9165, lon:79.1325}
+];
+
+function updateNearestList() {
+  const el = document.getElementById('countryList');
+  if (myLat === null) { el.innerHTML = 'Move to populate nearest list (waiting for GPS)...'; return; }
+  const sorted = samplePlaces.map(p => ({...p, dist: haversine(myLat, myLon, p.lat, p.lon)})).sort((a,b)=>a.dist-b.dist);
+  el.innerHTML = sorted.map(s => `<div>${s.name} — ${s.dist.toFixed(1)} km</div>`).join('');
+}
+setInterval(updateNearestList, 3000);
+updateNearestList();
+
+</script>
+</body>
+</html>
